@@ -1,0 +1,218 @@
+---
+# ===================================================================
+# PostgreSQL Discovery Playbook
+# Optimized: Single ps snapshot, Linux-only, scalable to 10k hosts
+# WEBHOOK ONLY - No File Saving
+# ===================================================================
+
+- name: PostgreSQL Discovery - Optimized Single ps Snapshot
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # ===================================================================
+    # STEP 0: Take a Single Snapshot of All Running Processes
+    # ===================================================================
+
+    - name: Capture full process list once
+      shell: ps auxww
+      register: ps_snapshot
+      changed_when: false
+      failed_when: false
+
+    # ===================================================================
+    # Detect network tool once
+    # ===================================================================
+    - name: Detect network tool
+      shell: |
+        if command -v ss >/dev/null 2>&1; then echo "ss"
+        elif command -v netstat >/dev/null 2>&1; then echo "netstat"
+        elif command -v lsof >/dev/null 2>&1; then echo "lsof"
+        else echo "none"; fi
+      register: network_tool
+      changed_when: false
+      failed_when: false
+
+    # ===================================================================
+    # STEP 1: Extract PostgreSQL Processes From Single Snapshot
+    # ===================================================================
+    - name: Extract PostgreSQL processes from snapshot
+      shell: |
+        echo "{{ ps_snapshot.stdout }}" | \
+        grep -E '[p]ostgres|[p]ostmaster' | \
+        awk '{print $2":"$11}' | sort -u
+      register: running_postgres_processes
+      changed_when: false
+      failed_when: false
+
+    # ===================================================================
+    # STEP 2: Extract Unique Binary Paths
+    # ===================================================================
+    - name: Extract unique binaries from ps snapshot
+      shell: |
+        echo "{{ ps_snapshot.stdout }}" | \
+        grep -E '[p]ostgres|[p]ostmaster' | \
+        awk '{print $11}' | sort -u
+      register: unique_binaries_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Validate binaries exist
+      shell: |
+        echo "{{ unique_binaries_raw.stdout }}" | tr ' ' '\n' | while read bin; do
+          if [ -x "$bin" ]; then echo "$bin"; fi
+        done
+      register: unique_binaries
+      changed_when: false
+      failed_when: false
+
+    - name: Set unique binaries fact
+      set_fact:
+        postgres_unique_binaries: "{{ unique_binaries.stdout_lines | default([]) }}"
+
+    # ===================================================================
+    # STEP 3: Collect Metadata for Each Binary
+    # ===================================================================
+    - name: Collect all data for each unique binary
+      shell: |
+        BINARY="{{ item }}"
+
+        # Extract matching PIDs from single ps snapshot
+        PIDS=$(echo "{{ ps_snapshot.stdout }}" | \
+          grep -E '[p]ostgres|[p]ostmaster' | \
+          awk -v bin="$BINARY" '$11 == bin {print $2}' | paste -sd, -)
+
+        VERSION="unknown"
+        if [ -x "$BINARY" ]; then
+          VERSION=$($BINARY --version 2>/dev/null | grep -oP 'postgres \(PostgreSQL\) \K[0-9]+\.[0-9]+' | head -1)
+        fi
+        [ -z "$VERSION" ] && VERSION="unknown"
+
+        DATADIR=""
+        CONFIG_PATH=""
+        if [ -n "$PIDS" ]; then
+          FIRST_PID=$(echo $PIDS | cut -d, -f1)
+          FULL_CMD=$(echo "{{ ps_snapshot.stdout }}" | grep " $FIRST_PID ")
+
+          DATADIR=$(echo "$FULL_CMD" | grep -oP '\-D\s*\K[^ ]+')
+          if [ -z "$DATADIR" ]; then
+            DATADIR=$(ps eww -p $FIRST_PID | grep -oP 'PGDATA=\K[^ ]+')
+          fi
+
+          if [ -z "$DATADIR" ]; then
+            for dir in /var/lib/pgsql/*/data /var/lib/postgresql/*/main /usr/local/pgsql/data; do
+              if [ -d "$dir" ] && [ -f "$dir/PG_VERSION" ]; then
+                DATADIR="$dir"
+                break
+              fi
+            done
+          fi
+
+          if [ -n "$DATADIR" ] && [ -f "$DATADIR/postgresql.conf" ]; then
+            CONFIG_PATH="$DATADIR/postgresql.conf"
+          elif [ -n "$DATADIR" ] && [ -f "$DATADIR/postgresql.auto.conf" ]; then
+            CONFIG_PATH="$DATADIR/postgresql.auto.conf"
+          fi
+        fi
+
+        [ -z "$DATADIR" ] && DATADIR="/var/lib/pgsql/data"
+        [ -z "$CONFIG_PATH" ] && CONFIG_PATH="not-found"
+
+        PORTS=""
+        case "{{ network_tool.stdout }}" in
+          ss)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(ss -ltnp | grep "pid=$pid" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done
+            ;;
+          netstat)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(netstat -tulnp | grep "$pid/" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done
+            ;;
+          lsof)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(lsof -p $pid -i -P -n | awk '{print $9}' | awk -F: '{print $2}')"
+            done
+            ;;
+        esac
+
+        PORTS=$(echo $PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
+        [ -z "$PORTS" ] && PORTS="none"
+
+        LOGDIR=""
+        if [ -n "$DATADIR" ] && [ -d "$DATADIR/log" ]; then
+          LOGDIR="$DATADIR/log"
+        elif [ -n "$DATADIR" ] && [ -d "$DATADIR/pg_log" ]; then
+          LOGDIR="$DATADIR/pg_log"
+        else
+          LOGDIR="/var/log/postgresql"
+        fi
+
+        PG_VERSION_FILE=""
+        if [ -f "$DATADIR/PG_VERSION" ]; then
+          PG_VERSION_FILE=$(cat "$DATADIR/PG_VERSION")
+        fi
+
+        echo "BINARY=$BINARY|||PIDS=$PIDS|||VERSION=$VERSION|||CONFIG=$CONFIG_PATH|||DATADIR=$DATADIR|||PORTS=$PORTS|||LOGDIR=$LOGDIR|||BINDIR=$(dirname "$BINARY")|||PGVERSION=$PG_VERSION_FILE"
+      args:
+        executable: /bin/bash
+      register: postgres_data_collection
+      changed_when: false
+      failed_when: false
+      loop: "{{ postgres_unique_binaries }}"
+      when: postgres_unique_binaries | length > 0
+
+    # ===================================================================
+    # STEP 4: Parse into JSON
+    # ===================================================================
+    - name: Init discovery array
+      set_fact:
+        discovery_array: []
+
+    - name: Parse each instance
+      set_fact:
+        discovery_array: "{{ discovery_array + [json_instance] }}"
+      vars:
+        data_line: "{{ item.stdout }}"
+        binary_path: "{{ data_line | regex_search('BINARY=([^|]+)', '\\1') | first }}"
+        pids_raw: "{{ data_line | regex_search('PIDS=([^|]+)', '\\1') | first }}"
+        version: "{{ data_line | regex_search('VERSION=([^|]+)', '\\1') | first }}"
+        config_path: "{{ data_line | regex_search('CONFIG=([^|]+)', '\\1') | first }}"
+        datadir: "{{ data_line | regex_search('DATADIR=([^|]+)', '\\1') | first }}"
+        ports_raw: "{{ data_line | regex_search('PORTS=([^|]+)', '\\1') | first }}"
+        logdir: "{{ data_line | regex_search('LOGDIR=([^|]+)', '\\1') | first }}"
+        pgversion: "{{ data_line | regex_search('PGVERSION=([^|]+)', '\\1') | first }}"
+        pids_array: "{{ pids_raw.split(',') if pids_raw else [] }}"
+        ports_array: "{{ ports_raw.split(',') if ports_raw != 'none' else [] }}"
+        name: "{{ datadir | basename }}"
+        json_instance:
+          name: "{{ name }}"
+          version: "{{ version }}"
+          ports: "{{ ports_array }}"
+          pids: "{{ pids_array | map('int') | list }}"
+          bin_path: ["{{ binary_path }}"]
+          config_path: ["{{ config_path }}"]
+          data_path: ["{{ datadir }}"]
+          log_path: "{{ logdir }}"
+          pg_version: "{{ pgversion }}"
+          type: "DATABASE"
+      loop: "{{ postgres_data_collection.results }}"
+      when: item.stdout is defined
+
+    # ===================================================================
+    # STEP 5: Build Final JSON
+    # ===================================================================
+    - name: Create final JSON
+      set_fact:
+        postgres_discovery_json:
+          hostname: "{{ inventory_hostname }}"
+          ip_address: "{{ ansible_default_ipv4.address }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          discovery_timestamp: "{{ ansible_date_time.iso8601 }}"
+          discovery: "{{ discovery_array }}"
+
+    - name: Print output
+      debug:
+        msg: "PostgreSQL Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"

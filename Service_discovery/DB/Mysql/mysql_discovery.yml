@@ -1,0 +1,251 @@
+---
+# ========================================
+# MySQL/MariaDB Discovery Playbook
+# OPTIMIZED: Single PS Command Approach
+# WEBHOOK ONLY - No File Saving
+# ========================================
+
+- name: MySQL/MariaDB Discovery - Optimized Single PS Approach
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    # ========================================
+    # PREREQUISITE: Detect Available Tools
+    # ========================================
+    - name: Detect network tool
+      shell: |
+        if command -v ss >/dev/null 2>&1; then echo "ss"
+        elif command -v netstat >/dev/null 2>&1; then echo "netstat"
+        elif command -v lsof >/dev/null 2>&1; then echo "lsof"
+        else echo "none"; fi
+      register: network_tool
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # SINGLE PS COMMAND - EXTRACT EVERYTHING
+    # ========================================
+    - name: Extract all MySQL/MariaDB process details in one call
+      shell: |
+        ps aux | grep -E '[m]ysqld|[m]ariadbd' | while read -r line; do
+          # Parse the ps output
+          pid=$(echo "$line" | awk '{print $2}')
+          binary=$(echo "$line" | awk '{print $11}')
+          full_args=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i; print ""}')
+          
+          # Extract parameters from command line arguments
+          basedir=$(echo "$full_args" | sed -n 's/.*--basedir=\([^ ]*\).*/\1/p' | head -1)
+          datadir=$(echo "$full_args" | sed -n 's/.*--datadir=\([^ ]*\).*/\1/p' | head -1)
+          defaults_file=$(echo "$full_args" | sed -n 's/.*--defaults-file=\([^ ]*\).*/\1/p' | head -1)
+          socket=$(echo "$full_args" | sed -n 's/.*--socket=\([^ ]*\).*/\1/p' | head -1)
+          port=$(echo "$full_args" | sed -n 's/.*--port=\([^ ]*\).*/\1/p' | head -1)
+          
+          # Resolve binary path
+          if [ -n "$binary" ] && [ -e "$binary" ]; then
+            binary=$(readlink -f "$binary" 2>/dev/null || echo "$binary")
+          fi
+          
+          # Determine instance key (priority: datadir > basedir > defaults_file > binary)
+          if [ -n "$datadir" ]; then
+            instance_key="$datadir"
+          elif [ -n "$basedir" ]; then
+            instance_key="$basedir"
+          elif [ -n "$defaults_file" ]; then
+            instance_key="$defaults_file"
+          else
+            instance_key="$binary"
+          fi
+          
+          # Output as JSON object (one per line for easy parsing)
+          cat <<EOF
+        {"pid":"${pid}","binary":"${binary:-not-found}","basedir":"${basedir:-}","datadir":"${datadir:-}","defaults_file":"${defaults_file:-}","socket":"${socket:-}","port":"${port:-}","instance_key":"${instance_key}"}
+        EOF
+        done
+      args:
+        executable: /bin/bash
+      register: mysql_processes_raw
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # PARSE RAW OUTPUT INTO STRUCTURED DATA
+    # ========================================
+    - name: Parse MySQL processes into list
+      set_fact:
+        mysql_processes: "{{ mysql_processes_raw.stdout_lines | default([]) | map('from_json') | list }}"
+      when: mysql_processes_raw.stdout_lines | default([]) | length > 0
+
+    - name: Set empty list if no processes found
+      set_fact:
+        mysql_processes: []
+      when: mysql_processes_raw.stdout_lines | default([]) | length == 0
+
+    # ========================================
+    # GROUP BY UNIQUE INSTANCE KEY
+    # ========================================
+    - name: Get unique instance keys
+      set_fact:
+        mysql_unique_instances: "{{ mysql_processes | map(attribute='instance_key') | unique | list }}"
+      when: mysql_processes | length > 0
+
+    - name: Set empty instances if no processes
+      set_fact:
+        mysql_unique_instances: []
+      when: mysql_processes | length == 0
+
+    # ========================================
+    # BUILD INSTANCE DATA FROM PARSED PROCESSES
+    # ========================================
+    - name: Collect additional data for each instance (version, listening ports)
+      shell: |
+        INSTANCE_KEY="{{ item }}"
+        
+        # Get first matching process binary for version check
+        BINARY="{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='binary') | first) | default('not-found') }}"
+        FIRST_PID="{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='pid') | first) | default('') }}"
+        
+        # Get version
+        VERSION="unknown"
+        if [ -n "$BINARY" ] && [ -x "$BINARY" ] && [ "$BINARY" != "not-found" ]; then
+          VERSION=$($BINARY --version 2>/dev/null | head -n1 | sed -n 's/.*Ver \([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p' | head -1)
+        fi
+        
+        if [ -z "$VERSION" ] || [ "$VERSION" = "unknown" ]; then
+          if command -v mysql >/dev/null 2>&1; then
+            VERSION=$(mysql --version 2>/dev/null | sed -n 's/.*Distrib \([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p' | head -1)
+          fi
+        fi
+        [ -z "$VERSION" ] && VERSION="unknown"
+        
+        # Get listening ports for all PIDs of this instance
+        PIDS="{{ mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='pid') | join(',') }}"
+        PORTS=""
+        case "{{ network_tool.stdout }}" in
+          ss)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(ss -ltnp 2>/dev/null | grep "pid=$pid" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done
+            ;;
+          netstat)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(netstat -tulnp 2>/dev/null | grep "$pid/" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done
+            ;;
+          lsof)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(lsof -p $pid -i -P -n 2>/dev/null | awk '{print $9}' | awk -F: '{print $2}')"
+            done
+            ;;
+        esac
+        PORTS=$(echo $PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
+        [ -z "$PORTS" ] && PORTS="none"
+        
+        # Find config file - check command line first, then standard locations
+        CONFIG_FILE="{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='defaults_file') | select() | first) | default('') }}"
+        DATADIR="{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='datadir') | select() | first) | default(item) }}"
+        BASEDIR="{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='basedir') | select() | first) | default('/usr') }}"
+        
+        if [ -z "$CONFIG_FILE" ] || [ "$CONFIG_FILE" = "not-found" ]; then
+          # Check standard MySQL config file locations in order of precedence
+          for conf in "/etc/mysql/my.cnf" "/etc/my.cnf" "$BASEDIR/my.cnf" "$DATADIR/my.cnf" "/usr/etc/my.cnf" "~/.my.cnf"; do
+            if [ -f "$conf" ] && [ -r "$conf" ]; then
+              CONFIG_FILE="$conf"
+              break
+            fi
+          done
+        fi
+        [ -z "$CONFIG_FILE" ] && CONFIG_FILE="not-found"
+        
+        # Find socket if not in command line
+        SOCKET="{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='socket') | select() | first) | default('') }}"
+        
+        if [ -z "$SOCKET" ]; then
+          for sock in /var/lib/mysql/mysql.sock /tmp/mysql.sock /var/run/mysqld/mysqld.sock "$DATADIR/mysql.sock"; do
+            if [ -S "$sock" ]; then
+              SOCKET="$sock"
+              break
+            fi
+          done
+        fi
+        [ -z "$SOCKET" ] && SOCKET="/var/lib/mysql/mysql.sock"
+        
+        echo "VERSION=$VERSION|||PORTS=$PORTS|||SOCKET=$SOCKET|||CONFIG=$CONFIG_FILE"
+      args:
+        executable: /bin/bash
+      register: mysql_additional_data
+      changed_when: false
+      failed_when: false
+      loop: "{{ mysql_unique_instances }}"
+      when: mysql_unique_instances | length > 0
+
+    # ========================================
+    # BUILD FINAL JSON STRUCTURE
+    # ========================================
+    - name: Initialize discovery array
+      set_fact:
+        discovery_array: []
+
+    - name: Build discovery array from parsed data
+      set_fact:
+        discovery_array: "{{ discovery_array + [json_instance] }}"
+      vars:
+        instance_key: "{{ item.item }}"
+        additional_data: "{{ item.stdout | default('') }}"
+        
+        # Get all processes for this instance from our already-parsed data
+        instance_processes: "{{ mysql_processes | selectattr('instance_key', 'equalto', instance_key) | list }}"
+        
+        # Extract from pre-parsed process data (no additional ps needed!)
+        all_pids: "{{ instance_processes | map(attribute='pid') | map('int') | list }}"
+        binary_path: "{{ (instance_processes | map(attribute='binary') | select() | first) | default('not-found') }}"
+        basedir: "{{ (instance_processes | map(attribute='basedir') | select() | first) | default('/usr') }}"
+        datadir: "{{ (instance_processes | map(attribute='datadir') | select() | first) | default(instance_key) }}"
+        
+        # Extract from additional data collection
+        version_list: "{{ additional_data | regex_search('VERSION=([^|]+)', '\\1') | default(['unknown'], true) }}"
+        ports_raw_list: "{{ additional_data | regex_search('PORTS=([^|]+)', '\\1') | default([''], true) }}"
+        socket_list: "{{ additional_data | regex_search('SOCKET=([^|]+)', '\\1') | default(['/var/lib/mysql/mysql.sock'], true) }}"
+        config_list: "{{ additional_data | regex_search('CONFIG=([^|]+)', '\\1') | default(['not-found'], true) }}"
+        
+        version: "{{ version_list | first }}"
+        ports_raw: "{{ ports_raw_list | first }}"
+        socket_path: "{{ socket_list | first }}"
+        config_path: "{{ config_list | first }}"
+        
+        ports_array: "{{ ports_raw.split(',') | select() | map('int') | list if (ports_raw | length > 0 and ports_raw != 'none') else [] }}"
+        name: "{{ datadir | basename }}"
+        
+        json_instance:
+          name: "{{ name }}"
+          version: "{{ version }}"
+          ports: "{{ ports_array }}"
+          pids: "{{ all_pids }}"
+          bin_path: ["{{ binary_path }}"]
+          config_path: ["{{ config_path }}"]
+          data_path: ["{{ datadir }}"]
+          basedir: "{{ basedir }}"
+          socket: "{{ socket_path }}"
+          type: "DATABASE"
+      loop: "{{ mysql_additional_data.results | default([]) }}"
+      when:
+        - mysql_unique_instances is defined
+        - mysql_unique_instances | length > 0
+        - item.stdout is defined
+        
+    # ========================================
+    # BUILD FINAL JSON STRUCTURE
+    # ========================================
+    - name: Build final JSON structure
+      set_fact:
+        mysql_discovery_json:
+          hostname: "{{ inventory_hostname }}"
+          ip_address: "{{ ansible_default_ipv4.address | default('N/A') }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          discovery_timestamp: "{{ ansible_date_time.iso8601 }}"
+          discovery: "{{ discovery_array | default([]) }}"
+
+    - name: Display JSON output
+      debug:
+        msg: "MySQL Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"

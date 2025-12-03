@@ -1,0 +1,203 @@
+---
+# ========================================
+# Tomcat Discovery Playbook
+# Process-First Approach with JSON Output
+# WEBHOOK ONLY - No File Saving
+# ========================================
+
+- name: Tomcat Discovery - Process-First Approach
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    # ========================================
+    # PREREQUISITE: Detect Available Tools
+    # ========================================
+    - name: Detect network tool
+      shell: |
+        if command -v ss >/dev/null 2>&1; then echo "ss"
+        elif command -v netstat >/dev/null 2>&1; then echo "netstat"
+        elif command -v lsof >/dev/null 2>&1; then echo "lsof"
+        else echo "none"; fi
+      register: network_tool
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # STEP 1: GET ALL TOMCAT PROCESS DATA IN ONE COMMAND
+    # ========================================
+    - name: Get all Tomcat process data in single command
+      shell: |
+        ps -eo pid,cmd | grep '[o]rg.apache.catalina.startup.Bootstrap' | \
+        awk '{
+          pid=$1
+          home=""
+          base=""
+          for(i=2;i<=NF;i++) {
+            if($i ~ /-Dcatalina.home=/) {
+              home=$i
+              gsub(/-Dcatalina.home=/,"",home)
+            }
+            if($i ~ /-Dcatalina.base=/) {
+              base=$i
+              gsub(/-Dcatalina.base=/,"",base)
+            }
+          }
+          if(base=="") base=home
+          print pid":"home":"base
+        }' | sort -u
+      register: all_tomcat_processes
+      changed_when: false
+      failed_when: false
+
+    - name: Extract unique instances
+      set_fact:
+        tomcat_unique_instances: "{{ all_tomcat_processes.stdout_lines | map('regex_replace', '^[0-9]+:', '') | unique | list }}"
+
+    - name: Debug - Show discovered processes and instances
+      debug:
+        msg:
+          - "Raw process data: {{ all_tomcat_processes.stdout_lines }}"
+          - "Unique instances: {{ tomcat_unique_instances }}"
+
+    # ========================================
+    # STEP 2: COLLECT ALL DATA FOR EACH INSTANCE
+    # ========================================
+    - name: Collect all data for each unique Tomcat instance
+      shell: |
+        #!/bin/bash
+        IFS=':' read -r CATALINA_HOME CATALINA_BASE <<< "{{ item }}"
+        
+        # Get PIDs for this specific instance from cached data
+        PIDS=$(echo '{{ all_tomcat_processes.stdout_lines | join("\n") }}' | grep ":$CATALINA_HOME:$CATALINA_BASE$" | cut -d: -f1 | paste -sd, -)
+        
+        # Debug output
+        echo "DEBUG: Processing instance $CATALINA_HOME:$CATALINA_BASE" >&2
+        echo "DEBUG: Found PIDs: $PIDS" >&2
+        
+        # Get version
+        CATALINA_SH="$CATALINA_HOME/bin/catalina.sh"
+        if [ -x "$CATALINA_SH" ]; then
+          VERSION=$(CATALINA_HOME="$CATALINA_HOME" "$CATALINA_SH" version 2>/dev/null | grep 'Server version:' | sed 's/.*Apache Tomcat\///' | awk '{print $1}')
+        else
+          VERSION="unknown"
+        fi
+        [ -z "$VERSION" ] && VERSION="unknown"
+        
+        # Get config path (server.xml)
+        CONFIG_PATH="$CATALINA_BASE/conf/server.xml"
+        if [ ! -f "$CONFIG_PATH" ]; then
+          CONFIG_PATH="not-found"
+        fi
+        
+        # Get bin directory
+        BIN_DIR="$CATALINA_HOME/bin"
+        
+        # Get ports for these specific PIDs from runtime (actual listening ports only)
+        PORTS=""
+        case "{{ network_tool.stdout }}" in
+          ss)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(ss -ltnp 2>/dev/null | grep "pid=$pid" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done
+            ;;
+          netstat)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(netstat -tulnp 2>/dev/null | grep "$pid/" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done
+            ;;
+          lsof)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(lsof -p $pid -i -P -n 2>/dev/null | awk '{print $9}' | awk -F: '{print $2}')"
+            done
+            ;;
+        esac
+        
+        PORTS=$(echo $PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
+        [ -z "$PORTS" ] && PORTS="none"
+        
+        # Get configured ports from server.xml (for reference, separate from runtime)
+        CONFIG_PORTS="none"
+        if [ -f "$CONFIG_PATH" ]; then
+          CONFIG_PORTS=$(grep -v '<!--' "$CONFIG_PATH" 2>/dev/null | grep -oP 'port="\K[0-9]+' | sort -u | paste -sd, -)
+          [ -z "$CONFIG_PORTS" ] && CONFIG_PORTS="none"
+        fi
+        
+        # Get JVM options (key parameters)
+        JVM_OPTS=""
+        if [ -n "$PIDS" ]; then
+          FIRST_PID=$(echo $PIDS | cut -d, -f1)
+          JVM_OPTS=$(ps -p $FIRST_PID -o args= 2>/dev/null | grep -oP '(-Xm[sx][^ ]+|-XX:[^ ]+)' | head -5 | paste -sd'###' -)
+        fi
+        
+        # Output delimited format
+        echo "CATALINA_HOME=$CATALINA_HOME|||CATALINA_BASE=$CATALINA_BASE|||PIDS=$PIDS|||VERSION=$VERSION|||CONFIG=$CONFIG_PATH|||BINDIR=$BIN_DIR|||PORTS=$PORTS|||CONFIG_PORTS=$CONFIG_PORTS|||JVMOPTS=$JVM_OPTS"
+      args:
+        executable: /bin/bash
+      register: tomcat_data_collection
+      changed_when: false
+      failed_when: false
+      loop: "{{ tomcat_unique_instances }}"
+      when: tomcat_unique_instances | length > 0
+
+    # ========================================
+    # STEP 3: PARSE AND BUILD INSTANCES IN JSON FORMAT
+    # ========================================
+    - name: Initialize discovery array
+      set_fact:
+        discovery_array: []
+
+    - name: Parse and build JSON formatted instances
+      set_fact:
+        discovery_array: "{{ discovery_array + [json_instance] }}"
+      vars:
+        data_line: "{{ item.stdout }}"
+        catalina_home: "{{ data_line | regex_search('CATALINA_HOME=([^|]+)', '\\1') | first }}"
+        catalina_base: "{{ data_line | regex_search('CATALINA_BASE=([^|]+)', '\\1') | first }}"
+        pids_raw: "{{ data_line | regex_search('PIDS=([^|]+)', '\\1') | first }}"
+        version: "{{ data_line | regex_search('VERSION=([^|]+)', '\\1') | first }}"
+        config_path: "{{ data_line | regex_search('CONFIG=([^|]+)', '\\1') | first }}"
+        ports_raw: "{{ data_line | regex_search('PORTS=([^|]+)', '\\1') | first }}"
+        config_ports_raw: "{{ data_line | regex_search('CONFIG_PORTS=([^|]+)', '\\1') | first }}"
+        # Convert comma-separated strings to arrays
+        pids_array: "{{ pids_raw.split(',') | map('int') | list if pids_raw and pids_raw != '' else [] }}"
+        ports_array: "{{ ports_raw.split(',') | map('int') | list if ports_raw and ports_raw != 'none' and ports_raw != '' else [] }}"
+        config_ports_array: "{{ config_ports_raw.split(',') | map('int') | list if config_ports_raw and config_ports_raw != 'none' and config_ports_raw != '' else [] }}"
+        # Determine name from catalina.base (e.g., /opt/tomcat10 -> tomcat10)
+        name: "{{ catalina_base | basename }}"
+        bin_path: "{{ catalina_home }}/bin/catalina.sh"
+        json_instance:
+          name: "{{ name }}"
+          version: "{{ version }}"
+          ports: "{{ ports_array }}"
+          config_ports: "{{ config_ports_array }}"
+          pids: "{{ pids_array }}"
+          bin_path: ["{{ bin_path }}"]
+          config_path: ["{{ config_path }}"]
+          data_path: ["{{ catalina_base }}"]
+          catalina_home: "{{ catalina_home }}"
+          catalina_base: "{{ catalina_base }}"
+          type: "MIDDLEWARE"
+      loop: "{{ tomcat_data_collection.results }}"
+      when: 
+        - tomcat_unique_instances is defined
+        - tomcat_unique_instances | length > 0
+        - tomcat_data_collection is defined
+        - item.stdout is defined
+
+    # ========================================
+    # STEP 4: BUILD FINAL JSON STRUCTURE
+    # ========================================
+    - name: Build final JSON structure
+      set_fact:
+        tomcat_discovery_json:
+          hostname: "{{ inventory_hostname }}"
+          ip_address: "{{ ansible_default_ipv4.address | default('N/A') }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          discovery_timestamp: "{{ ansible_date_time.iso8601 }}"
+          discovery: "{{ discovery_array | default([]) }}"
+
+    - name: Display JSON output
+      debug:
+        msg: "Tomcat Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"

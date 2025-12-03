@@ -1,0 +1,184 @@
+---
+# ========================================
+# MongoDB Discovery Playbook - Optimized
+# Linux-only, Single ps Snapshot, JSON Output
+# WEBHOOK ONLY - No File Saving
+# ========================================
+
+- name: MongoDB Discovery - Optimized Single ps Snapshot
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # ========================================
+    # STEP 0: Take a single snapshot of all processes
+    # ========================================
+    - name: Capture full process list once
+      shell: ps auxww
+      register: ps_snapshot
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # Detect network tool once
+    # ========================================
+    - name: Detect network tool
+      shell: |
+        if command -v ss >/dev/null 2>&1; then echo "ss"
+        elif command -v netstat >/dev/null 2>&1; then echo "netstat"
+        elif command -v lsof >/dev/null 2>&1; then echo "lsof"
+        else echo "none"; fi
+      register: network_tool
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # STEP 1: Extract MongoDB processes from snapshot
+    # ========================================
+    - name: Extract MongoDB processes
+      shell: |
+        echo "{{ ps_snapshot.stdout }}" | grep -E '[m]ongod' | awk '{print $2":"$11}' | sort -u
+      register: running_mongodb_processes
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # STEP 2: Extract unique binary paths
+    # ========================================
+    - name: Extract unique binaries
+      shell: |
+        echo "{{ ps_snapshot.stdout }}" | grep -E '[m]ongod' | awk '{print $11}' | sort -u
+      register: unique_binaries_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Validate unique binaries
+      shell: |
+        echo "{{ unique_binaries_raw.stdout }}" | tr ' ' '\n' | while read bin; do
+          if [ -x "$bin" ] && [ -f "$bin" ]; then
+            echo "$bin"
+          fi
+        done
+      register: unique_binaries
+      changed_when: false
+      failed_when: false
+
+    - name: Set unique binaries fact
+      set_fact:
+        mongodb_unique_binaries: "{{ unique_binaries.stdout_lines | default([]) }}"
+
+    # ========================================
+    # STEP 3: Collect metadata for each binary
+    # ========================================
+    - name: Collect all data for each unique binary
+      shell: |
+        BINARY="{{ item }}"
+        PIDS=$(echo "{{ ps_snapshot.stdout }}" | grep -E '[m]ongod' | awk -v bin="$BINARY" '$11 == bin {print $2}' | paste -sd, -)
+
+        VERSION="unknown"
+        if [ -x "$BINARY" ]; then
+          VERSION=$($BINARY --version 2>/dev/null | grep -oP 'db version v\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        fi
+        [ -z "$VERSION" ] && VERSION="unknown"
+
+        CONFIG_PATH=""
+        DBPATH=""
+        if [ -n "$PIDS" ]; then
+          FIRST_PID=$(echo $PIDS | cut -d, -f1)
+          FULL_CMD=$(echo "{{ ps_snapshot.stdout }}" | grep " $FIRST_PID ")
+          CONFIG_PATH=$(echo "$FULL_CMD" | grep -oP '(\-\-config=|(?<=-f ))\K[^ ]+' | head -1)
+          [ -z "$CONFIG_PATH" ] && for conf in /etc/mongod.conf /etc/mongodb.conf; do [ -f "$conf" ] && CONFIG_PATH="$conf" && break; done
+          DBPATH=$(echo "$FULL_CMD" | grep -oP '\-\-dbpath=\K[^ ]+' | head -1)
+          if [ -z "$DBPATH" ] && [ -f "$CONFIG_PATH" ]; then
+            DBPATH=$(grep -E '^\s*dbPath:' "$CONFIG_PATH" 2>/dev/null | awk '{print $2}' | tr -d '"' | tr -d "'")
+          fi
+        fi
+
+        [ -z "$CONFIG_PATH" ] && CONFIG_PATH="not-found"
+        [ -z "$DBPATH" ] && DBPATH="/var/lib/mongo"
+
+        PORTS=""
+        case "{{ network_tool.stdout }}" in
+          ss)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(ss -ltnp 2>/dev/null | grep "pid=$pid" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done ;;
+          netstat)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(netstat -tulnp 2>/dev/null | grep "$pid/" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done ;;
+          lsof)
+            for pid in $(echo $PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(lsof -p $pid -i -P -n 2>/dev/null | awk '{print $9}' | awk -F: '{print $2}')"
+            done ;;
+        esac
+        PORTS=$(echo $PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
+        [ -z "$PORTS" ] && PORTS="none"
+
+        LOGPATH=""
+        if [ -f "$CONFIG_PATH" ] && [ "$CONFIG_PATH" != "not-found" ]; then
+          LOGPATH=$(grep -E '^\s*path:' "$CONFIG_PATH" 2>/dev/null | awk '{print $2}' | tr -d '"' | tr -d "'")
+        fi
+        [ -z "$LOGPATH" ] && LOGPATH="/var/log/mongodb/mongod.log"
+
+        BIN_DIR=$(dirname "$BINARY")
+        echo "BINARY=$BINARY|||PIDS=$PIDS|||VERSION=$VERSION|||CONFIG=$CONFIG_PATH|||DBPATH=$DBPATH|||PORTS=$PORTS|||LOGPATH=$LOGPATH|||BINDIR=$BIN_DIR"
+      args:
+        executable: /bin/bash
+      register: mongodb_data_collection
+      changed_when: false
+      failed_when: false
+      loop: "{{ mongodb_unique_binaries }}"
+      when: mongodb_unique_binaries | length > 0
+
+    # ========================================
+    # STEP 4: Parse into JSON
+    # ========================================
+    - name: Initialize discovery array
+      set_fact:
+        discovery_array: []
+
+    - name: Parse each instance
+      set_fact:
+        discovery_array: "{{ discovery_array + [json_instance] }}"
+      vars:
+        data_line: "{{ item.stdout }}"
+        binary_path: "{{ data_line | regex_search('BINARY=([^|]+)', '\\1') | first }}"
+        pids_raw: "{{ data_line | regex_search('PIDS=([^|]+)', '\\1') | first }}"
+        version: "{{ data_line | regex_search('VERSION=([^|]+)', '\\1') | first }}"
+        config_path: "{{ data_line | regex_search('CONFIG=([^|]+)', '\\1') | first }}"
+        dbpath: "{{ data_line | regex_search('DBPATH=([^|]+)', '\\1') | first }}"
+        ports_raw: "{{ data_line | regex_search('PORTS=([^|]+)', '\\1') | first }}"
+        logpath: "{{ data_line | regex_search('LOGPATH=([^|]+)', '\\1') | first }}"
+        pids_array: "{{ pids_raw.split(',') | map('int') | list if pids_raw else [] }}"
+        ports_array: "{{ ports_raw.split(',') | map('int') | list if ports_raw != 'none' else [] }}"
+        name: "{{ dbpath | basename }}"
+        json_instance:
+          name: "{{ name }}"
+          version: "{{ version }}"
+          ports: "{{ ports_array }}"
+          pids: "{{ pids_array }}"
+          bin_path: ["{{ binary_path }}"]
+          config_path: ["{{ config_path }}"]
+          data_path: ["{{ dbpath }}"]
+          log_path: "{{ logpath }}"
+          type: "DATABASE"
+      loop: "{{ mongodb_data_collection.results }}"
+      when: item.stdout is defined
+
+    # ========================================
+    # STEP 5: Build final JSON
+    # ========================================
+    - name: Build final JSON structure
+      set_fact:
+        mongodb_discovery_json:
+          hostname: "{{ inventory_hostname }}"
+          ip_address: "{{ ansible_default_ipv4.address | default('N/A') }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          discovery_timestamp: "{{ ansible_date_time.iso8601 }}"
+          discovery: "{{ discovery_array | default([]) }}"
+
+    - name: Display JSON output
+      debug:
+        msg: "MongoDB Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"

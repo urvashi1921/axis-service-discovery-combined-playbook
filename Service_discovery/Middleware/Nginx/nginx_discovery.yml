@@ -1,0 +1,206 @@
+---
+# ========================================
+# Nginx Discovery Playbook
+# Process-First Approach with JSON Output
+# WEBHOOK ONLY - No File Saving
+# ========================================
+
+- name: Nginx Discovery - Process-First Approach
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    # ========================================
+    # PREREQUISITE: Detect Available Tools
+    # ========================================
+    - name: Detect process detection tool
+      shell: |
+        if command -v pgrep >/dev/null 2>&1; then echo "pgrep"
+        elif command -v pidof >/dev/null 2>&1; then echo "pidof"
+        else echo "ps"; fi
+      register: process_tool
+      changed_when: false
+      failed_when: false
+
+    - name: Detect network tool
+      shell: |
+        if command -v ss >/dev/null 2>&1; then echo "ss"
+        elif command -v netstat >/dev/null 2>&1; then echo "netstat"
+        elif command -v lsof >/dev/null 2>&1; then echo "lsof"
+        else echo "none"; fi
+      register: network_tool
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # STEP 1: GET ALL RUNNING NGINX MASTER PROCESSES
+    # ========================================
+    - name: Get all running Nginx master processes with binary and config
+      shell: |
+        ps -eo pid,cmd --no-headers | grep '[n]ginx: master process' | awk '{
+            pid=$1;
+            bin=""; conf="DEFAULT";
+            for(i=2;i<=NF;i++){
+                if($i=="process"){ bin=$(i+1) }
+                if($i=="-c"){ conf=$(i+1) }
+            }
+            if(bin!=""){
+                print pid":"bin":"conf
+            }
+        }'
+      register: nginx_master_processes
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # STEP 2: PARSE MASTER PROCESSES
+    # ========================================
+    - name: Set nginx instances list
+      set_fact:
+        nginx_instances: "{{ nginx_master_processes.stdout_lines | default([]) }}"
+
+    - name: Display found instances
+      debug:
+        msg: "Found {{ nginx_instances | length }} Nginx instance(s)"
+
+    # ========================================
+    # STEP 3: COLLECT ALL DATA FOR EACH INSTANCE
+    # ========================================
+    - name: Collect all data for each nginx instance
+      shell: |
+        #!/bin/bash
+        
+        # Parse input (format: PID:BINARY:CONFIG)
+        IFS=':' read -r MASTER_PID BINARY CONFIG <<< "{{ item }}"
+        
+        # Get all PIDs (master + workers)
+        ALL_PIDS=$(ps --ppid "$MASTER_PID" -o pid= 2>/dev/null | paste -sd, -)
+        if [ -n "$ALL_PIDS" ]; then
+          ALL_PIDS="$MASTER_PID,$ALL_PIDS"
+        else
+          ALL_PIDS="$MASTER_PID"
+        fi
+        
+        # Get version
+        VERSION=$($BINARY -v 2>&1 | grep -oP 'nginx/\K[0-9.]+' | head -1)
+        [ -z "$VERSION" ] && VERSION="unknown"
+        
+        # Get bin directory
+        BIN_DIR=$(dirname "$BINARY")
+        
+        # Handle config path
+        if [ "$CONFIG" = "DEFAULT" ]; then
+          # No -c flag, get default config from nginx -V
+          CONF_PATH=$($BINARY -V 2>&1 | grep -oP -- '--conf-path=\K[^ ]+' | head -1)
+          if [ -z "$CONF_PATH" ]; then
+            # Fallback: try to get prefix and assume nginx.conf
+            PREFIX=$($BINARY -V 2>&1 | grep -oP -- '--prefix=\K[^ ]+' | head -1)
+            if [ -n "$PREFIX" ]; then
+              CONF_PATH="$PREFIX/conf/nginx.conf"
+            else
+              CONF_PATH="/etc/nginx/nginx.conf"
+            fi
+          fi
+          CONFIG="$CONF_PATH"
+        elif [[ "$CONFIG" != /* ]]; then
+          # Relative path provided with -c, resolve it
+          PREFIX=$($BINARY -V 2>&1 | grep -oP -- '--prefix=\K[^ ]+' | head -1)
+          if [ -n "$PREFIX" ]; then
+            CONFIG="$PREFIX/$CONFIG"
+          fi
+        fi
+        
+        # Get ports for all PIDs
+        PORTS=""
+        case "{{ network_tool.stdout }}" in
+          ss)
+            for pid in $(echo $ALL_PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(ss -ltnp 2>/dev/null | grep "pid=$pid" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done
+            ;;
+          netstat)
+            for pid in $(echo $ALL_PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(netstat -tulnp 2>/dev/null | grep "$pid/" | awk '{print $4}' | awk -F: '{print $NF}')"
+            done
+            ;;
+          lsof)
+            for pid in $(echo $ALL_PIDS | tr ',' ' '); do
+              PORTS="$PORTS $(lsof -p $pid -i -P -n 2>/dev/null | awk '{print $9}' | awk -F: '{print $2}')"
+            done
+            ;;
+        esac
+        
+        PORTS=$(echo $PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
+        [ -z "$PORTS" ] && PORTS="none"
+        
+        # Get prefix/data path
+        PREFIX=$($BINARY -V 2>&1 | grep -oP -- '--prefix=\K[^ ]+' | head -1)
+        [ -z "$PREFIX" ] && PREFIX="N/A"
+        
+        # Output delimited format
+        echo "BINARY=$BINARY|||PIDS=$ALL_PIDS|||VERSION=$VERSION|||CONFIG=$CONFIG|||BINDIR=$BIN_DIR|||PREFIX=$PREFIX|||PORTS=$PORTS|||MASTER_PID=$MASTER_PID"
+      args:
+        executable: /bin/bash
+      register: nginx_data_collection
+      changed_when: false
+      failed_when: false
+      loop: "{{ nginx_instances }}"
+      when: nginx_instances | length > 0
+
+    # ========================================
+    # STEP 4: PARSE AND BUILD INSTANCES IN JSON FORMAT
+    # ========================================
+    - name: Initialize discovery array
+      set_fact:
+        discovery_array: []
+
+    - name: Parse and build JSON formatted instances
+      set_fact:
+        discovery_array: "{{ discovery_array + [json_instance] }}"
+      vars:
+        data_line: "{{ item.stdout }}"
+        binary_path: "{{ data_line | regex_search('BINARY=([^|]+)', '\\1') | first }}"
+        pids_raw: "{{ data_line | regex_search('PIDS=([^|]+)', '\\1') | first }}"
+        version: "{{ data_line | regex_search('VERSION=([^|]+)', '\\1') | first }}"
+        config_path: "{{ data_line | regex_search('CONFIG=([^|]+)', '\\1') | first }}"
+        prefix: "{{ data_line | regex_search('PREFIX=([^|]+)', '\\1') | first }}"
+        ports_raw: "{{ data_line | regex_search('PORTS=([^|]+)', '\\1') | first }}"
+        master_pid: "{{ data_line | regex_search('MASTER_PID=([^|]+)', '\\1') | first }}"
+        # Convert comma-separated strings to arrays
+        pids_array: "{{ pids_raw.split(',') | map('int') | list if pids_raw and pids_raw != '' else [] }}"
+        ports_array: "{{ ports_raw.split(',') | map('int') | list if ports_raw and ports_raw != 'none' and ports_raw != '' else [] }}"
+        # Determine name from binary path
+        name: "{{ binary_path | basename }}"
+        json_instance:
+          name: "{{ name }}"
+          version: "{{ version }}"
+          ports: "{{ ports_array }}"
+          pids: "{{ pids_array }}"
+          master_pid: "{{ master_pid | int }}"
+          bin_path: ["{{ binary_path }}"]
+          config_path: ["{{ config_path }}"]
+          data_path: ["{{ prefix }}"]
+          type: "MIDDLEWARE"
+      loop: "{{ nginx_data_collection.results }}"
+      when: 
+        - nginx_instances is defined
+        - nginx_instances | length > 0
+        - nginx_data_collection is defined
+        - item.stdout is defined
+
+    # ========================================
+    # STEP 5: BUILD FINAL JSON STRUCTURE
+    # ========================================
+    - name: Build final JSON structure
+      set_fact:
+        nginx_discovery_json:
+          hostname: "{{ inventory_hostname }}"
+          ip_address: "{{ ansible_default_ipv4.address | default('N/A') }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          discovery_timestamp: "{{ ansible_date_time.iso8601 }}"
+          discovery: "{{ discovery_array | default([]) }}"
+
+    - name: Display JSON output
+      debug:
+        msg: "Nginx Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"

@@ -1,0 +1,196 @@
+---
+# ========================================
+# Apache Discovery Playbook
+# Process-First Approach with JSON Output
+# WEBHOOK ONLY - No File Saving
+# ========================================
+
+- name: Apache Discovery - Process-First Approach
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    # ========================================
+    # PREREQUISITE: Detect Available Tools
+    # ========================================
+    - name: Detect network tool
+      shell: |
+        if command -v ss >/dev/null 2>&1; then echo "ss"
+        elif command -v netstat >/dev/null 2>&1; then echo "netstat"
+        elif command -v lsof >/dev/null 2>&1; then echo "lsof"
+        else echo "none"; fi
+      register: network_tool
+      changed_when: false
+      failed_when: false
+
+    # ========================================
+    # STEP 1: GET ALL APACHE PROCESS DATA IN SINGLE CALL
+    # ========================================
+    - name: Get all Apache process data in single optimized call
+      shell: |
+        ps aux | grep -E '[h]ttpd|[a]pache2' | awk '{print $2":"$11":"$1}' > /tmp/apache_processes.tmp
+        if [ -s /tmp/apache_processes.tmp ]; then
+          echo "PROCESSES:"
+          cat /tmp/apache_processes.tmp | sort -u
+          echo "BINARIES:"
+          awk -F: '{print $2}' /tmp/apache_processes.tmp | sort -u
+        fi
+        rm -f /tmp/apache_processes.tmp
+      register: apache_process_data
+      changed_when: false
+      failed_when: false
+
+    - name: Parse process data and set variables
+      set_fact:
+        running_apache_processes: "{{ apache_process_data.stdout_lines | select('match', '^[0-9]+:') | list }}"
+        unique_binaries: "{{ apache_process_data.stdout_lines | select('match', '^/') | list }}"
+
+    # ========================================
+    # STEP 3: COLLECT ALL DATA FOR EACH BINARY
+    # ========================================
+    - name: Collect all data for each unique binary
+      shell: |
+        #!/bin/bash
+        BINARY="{{ item }}"
+        
+        # Get PIDs from cached process data
+        PIDS=$(echo '{{ running_apache_processes | join("\n") }}' | awk -F: -v bin="$BINARY" '$2 == bin {print $1}' | paste -sd, -)
+        
+        # Get bin directory and apachectl path
+        BIN_DIR=$(dirname "$BINARY")
+        APACHECTL="$BIN_DIR/apachectl"
+        
+        # Get version and config in single call using apachectl or binary
+        if [ -x "$APACHECTL" ]; then
+          VERSION=$("$APACHECTL" -v 2>/dev/null | grep -i 'Server version' | sed 's/.*Apache\///' | awk '{print $1}')
+          CONFIG_OUTPUT=$("$APACHECTL" -V 2>/dev/null)
+        elif [ -x "$BINARY" ]; then
+          VERSION=$("$BINARY" -v 2>/dev/null | grep -i 'Server version' | sed 's/.*Apache\///' | awk '{print $1}')
+          CONFIG_OUTPUT=$("$BINARY" -V 2>/dev/null)
+        else
+          VERSION="unknown"
+          CONFIG_OUTPUT=""
+        fi
+        [ -z "$VERSION" ] && VERSION="unknown"
+        
+        # Parse config path and server root from stored output
+        CONFIG_PATH=$(echo "$CONFIG_OUTPUT" | grep 'SERVER_CONFIG_FILE' | cut -d'"' -f2)
+        SERVER_ROOT=$(echo "$CONFIG_OUTPUT" | grep 'HTTPD_ROOT' | cut -d'"' -f2)
+        
+        # Handle relative config path
+        if [ -n "$CONFIG_PATH" ] && [ "${CONFIG_PATH:0:1}" != "/" ]; then
+          CONFIG_PATH="$SERVER_ROOT/$CONFIG_PATH"
+        fi
+        [ -z "$CONFIG_PATH" ] && CONFIG_PATH="unknown"
+        [ -z "$SERVER_ROOT" ] && SERVER_ROOT="unknown"
+        
+        # Get ports - optimized: single command per tool
+        PORTS=""
+        FIRST_PID=$(echo $PIDS | cut -d, -f1)
+        if [ -n "$FIRST_PID" ]; then
+          case "{{ network_tool.stdout }}" in
+            ss)
+              PORTS=$(ss -ltnp 2>/dev/null | grep -E "pid=($FIRST_PID|$(echo $PIDS | tr ',' '|'))" | awk '{print $4}' | awk -F: '{print $NF}' | sort -u | paste -sd, -)
+              ;;
+            netstat)
+              PORTS=$(netstat -tulnp 2>/dev/null | grep -E "/($FIRST_PID|$(echo $PIDS | tr ',' '|'))/" | awk '{print $4}' | awk -F: '{print $NF}' | sort -u | paste -sd, -)
+              ;;
+            lsof)
+              PORTS=$(lsof -p $(echo $PIDS | tr ',' ',') -i -P -n 2>/dev/null | grep LISTEN | awk '{print $9}' | awk -F: '{print $NF}' | sort -u | paste -sd, -)
+              ;;
+          esac
+        fi
+        [ -z "$PORTS" ] && PORTS="none"
+        
+        # Get configured ports from config file
+        CONFIG_PORTS="none"
+        if [ -f "$CONFIG_PATH" ]; then
+          CONFIG_PORTS=$(grep -i '^Listen' "$CONFIG_PATH" 2>/dev/null | awk '{print $2}' | grep -oE '[0-9]+' | sort -u | paste -sd, -)
+          [ -z "$CONFIG_PORTS" ] && CONFIG_PORTS="none"
+        fi
+        
+        # Get document root
+        DOC_ROOT="unknown"
+        if [ -f "$CONFIG_PATH" ]; then
+          DOC_ROOT=$(grep -i '^DocumentRoot' "$CONFIG_PATH" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
+          [ -z "$DOC_ROOT" ] && DOC_ROOT="unknown"
+        fi
+        
+        # Get run user
+        RUN_USER="unknown"
+        if [ -n "$FIRST_PID" ]; then
+          RUN_USER=$(ps -p $FIRST_PID -o user= 2>/dev/null)
+        fi
+        [ -z "$RUN_USER" ] && RUN_USER="unknown"
+        
+        # Output delimited format
+        echo "BINARY=$BINARY|||PIDS=$PIDS|||VERSION=$VERSION|||CONFIG=$CONFIG_PATH|||SERVER_ROOT=$SERVER_ROOT|||BINDIR=$BIN_DIR|||PORTS=$PORTS|||CONFIG_PORTS=$CONFIG_PORTS|||DOC_ROOT=$DOC_ROOT|||RUN_USER=$RUN_USER"
+      args:
+        executable: /bin/bash
+      register: apache_data_collection
+      changed_when: false
+      failed_when: false
+      loop: "{{ unique_binaries }}"
+      when: unique_binaries | length > 0
+
+    # ========================================
+    # STEP 4: PARSE AND BUILD INSTANCES IN JSON FORMAT
+    # ========================================
+    - name: Initialize discovery array
+      set_fact:
+        discovery_array: []
+
+    - name: Parse and build JSON formatted instances
+      set_fact:
+        discovery_array: "{{ discovery_array + [json_instance] }}"
+      vars:
+        data_line: "{{ item.stdout }}"
+        binary_path: "{{ data_line | regex_replace('.*BINARY=([^|]+).*', '\\1') | default('unknown') }}"
+        pids_raw: "{{ data_line | regex_replace('.*PIDS=([^|]+).*', '\\1') | default('') }}"
+        version: "{{ data_line | regex_replace('.*VERSION=([^|]+).*', '\\1') | default('unknown') }}"
+        config_path: "{{ data_line | regex_replace('.*CONFIG=([^|]+).*', '\\1') | default('unknown') }}"
+        server_root: "{{ data_line | regex_replace('.*SERVER_ROOT=([^|]+).*', '\\1') | default('unknown') }}"
+        bin_dir: "{{ data_line | regex_replace('.*BINDIR=([^|]+).*', '\\1') | default('unknown') }}"
+        ports_raw: "{{ data_line | regex_replace('.*PORTS=([^|]+).*', '\\1') | default('none') }}"
+        config_ports_raw: "{{ data_line | regex_replace('.*CONFIG_PORTS=([^|]+).*', '\\1') | default('none') }}"
+        doc_root: "{{ data_line | regex_replace('.*DOC_ROOT=([^|]+).*', '\\1') | default('unknown') }}"
+        run_user: "{{ data_line | regex_replace('.*RUN_USER=([^|]+).*', '\\1') | default('unknown') }}"
+        pids_array: "{{ pids_raw.split(',') | map('int') | list if pids_raw and pids_raw != '' else [] }}"
+        ports_array: "{{ ports_raw.split(',') | map('int') | list if ports_raw and ports_raw != 'none' and ports_raw != '' else [] }}"
+        config_ports_array: "{{ config_ports_raw.split(',') | map('int') | list if config_ports_raw and config_ports_raw != 'none' and config_ports_raw != '' else [] }}"
+        name: "{{ binary_path | basename }}"
+        json_instance:
+          name: "{{ name }}"
+          version: "{{ version }}"
+          ports: "{{ ports_array }}"
+          config_ports: "{{ config_ports_array }}"
+          pids: "{{ pids_array }}"
+          bin_path: ["{{ binary_path }}"]
+          config_path: ["{{ config_path }}"]
+          data_path: ["{{ doc_root }}"]
+          server_root: "{{ server_root }}"
+          run_user: "{{ run_user }}"
+          type: "WEBSERVER"
+      loop: "{{ apache_data_collection.results }}"
+      when: 
+        - unique_binaries is defined
+        - unique_binaries | length > 0
+        - apache_data_collection is defined
+        - item.stdout is defined
+
+    # ========================================
+    # STEP 5: BUILD FINAL JSON STRUCTURE
+    # ========================================
+    - name: Build final JSON structure
+      set_fact:
+        apache_discovery_json:
+          hostname: "{{ inventory_hostname }}"
+          ip_address: "{{ ansible_default_ipv4.address | default('N/A') }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          discovery_timestamp: "{{ ansible_date_time.iso8601 }}"
+          discovery: "{{ discovery_array | default([]) }}"
+
+    - name: Display JSON output
+      debug:
+        msg: "Apache Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"
