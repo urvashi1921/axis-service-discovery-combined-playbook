@@ -1,0 +1,15 @@
+---
+# Discovery Configuration
+discovery_job_name: "Service Discovery"
+discovery_execution_node: "{{ ansible_hostname }}"
+
+# Service tags
+middleware_services:
+  - apache
+  - nginx
+  - tomcat
+
+database_services:
+  - mysql
+  - postgres
+  - mongodb

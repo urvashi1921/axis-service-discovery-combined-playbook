@@ -1,0 +1,9 @@
+---
+# Webhook Configuration
+webhook_api_url: "http://52.66.252.78:5000/webhook/discovery"
+webhook_api_token: "{{ lookup('env', 'WEBHOOK_TOKEN') | default('', true) }}"
+webhook_timeout: 60
+webhook_retries: 3
+webhook_retry_delay: 5
+webhook_validate_certs: no
+webhook_expected_status_codes: [200, 201, 202]
