@@ -1,6 +1,6 @@
 ---
 # Webhook Configuration
-webhook_api_url: "http://13.203.200.240:5000/webhook/discovery"
+webhook_api_url: "https://filecompression.acc.ltd/ServiceDiscovery/api/v1/servicediscovery/ansiblecall"
 webhook_api_token: "{{ lookup('env', 'WEBHOOK_TOKEN') | default('', true) }}"
 webhook_timeout: 60
 webhook_retries: 3
