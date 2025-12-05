@@ -90,56 +90,57 @@
         - name: Build combined results payload
           set_fact:
             combined_payload:
-              job_info:
-                job_id: "{{ tower_job_id | default(ansible_date_time.epoch) }}"
-                job_name: "{{ tower_job_template_name | default(discovery_job_name) }}"
-                execution_time: "{{ ansible_date_time.iso8601 }}"
-                execution_node: "{{ discovery_execution_node }}"
-                status: "success"
-              discovery_results:
-                middleware:
-                  apache:
-                    total_servers: "{{ apache_results | length }}"
-                    total_instances: "{{ total_apache }}"
-                    servers: "{{ apache_results }}"
-                  nginx:
-                    total_servers: "{{ nginx_results | length }}"
-                    total_instances: "{{ total_nginx }}"
-                    servers: "{{ nginx_results }}"
-                  tomcat:
-                    total_servers: "{{ tomcat_results | length }}"
-                    total_instances: "{{ total_tomcat }}"
-                    servers: "{{ tomcat_results }}"
-                database:
-                  mysql:
-                    total_servers: "{{ mysql_results | length }}"
-                    total_instances: "{{ total_mysql }}"
-                    servers: "{{ mysql_results }}"
-                  postgresql:
-                    total_servers: "{{ postgres_results | length }}"
-                    total_instances: "{{ total_postgres }}"
-                    servers: "{{ postgres_results }}"
-                  mongodb:
-                    total_servers: "{{ mongodb_results | length }}"
-                    total_instances: "{{ total_mongodb }}"
-                    servers: "{{ mongodb_results }}"
-              summary:
-                total_middleware_instances: "{{ total_apache | int + total_nginx | int + total_tomcat | int }}"
-                total_database_instances: "{{ total_mysql | int + total_postgres | int + total_mongodb | int }}"
-                total_servers_scanned: "{{ groups['all'] | length }}"
-                discovery_breakdown:
-                  - service: "Apache"
-                    instances: "{{ total_apache }}"
-                  - service: "Nginx"
-                    instances: "{{ total_nginx }}"
-                  - service: "Tomcat"
-                    instances: "{{ total_tomcat }}"
-                  - service: "MySQL"
-                    instances: "{{ total_mysql }}"
-                  - service: "PostgreSQL"
-                    instances: "{{ total_postgres }}"
-                  - service: "MongoDB"
-                    instances: "{{ total_mongodb }}"
+              payload:
+                job_info:
+                  job_id: "{{ tower_job_id | default(ansible_date_time.epoch) }}"
+                  job_name: "{{ tower_job_template_name | default(discovery_job_name) }}"
+                  execution_time: "{{ ansible_date_time.iso8601 }}"
+                  execution_node: "{{ discovery_execution_node }}"
+                  status: "success"
+                discovery_results:
+                  middleware:
+                    apache:
+                      total_servers: "{{ apache_results | length }}"
+                      total_instances: "{{ total_apache }}"
+                      servers: "{{ apache_results }}"
+                    nginx:
+                      total_servers: "{{ nginx_results | length }}"
+                      total_instances: "{{ total_nginx }}"
+                      servers: "{{ nginx_results }}"
+                    tomcat:
+                      total_servers: "{{ tomcat_results | length }}"
+                      total_instances: "{{ total_tomcat }}"
+                      servers: "{{ tomcat_results }}"
+                  database:
+                    mysql:
+                      total_servers: "{{ mysql_results | length }}"
+                      total_instances: "{{ total_mysql }}"
+                      servers: "{{ mysql_results }}"
+                    postgresql:
+                      total_servers: "{{ postgres_results | length }}"
+                      total_instances: "{{ total_postgres }}"
+                      servers: "{{ postgres_results }}"
+                    mongodb:
+                      total_servers: "{{ mongodb_results | length }}"
+                      total_instances: "{{ total_mongodb }}"
+                      servers: "{{ mongodb_results }}"
+                summary:
+                  total_middleware_instances: "{{ total_apache | int + total_nginx | int + total_tomcat | int }}"
+                  total_database_instances: "{{ total_mysql | int + total_postgres | int + total_mongodb | int }}"
+                  total_servers_scanned: "{{ groups['all'] | length }}"
+                  discovery_breakdown:
+                    - service: "Apache"
+                      instances: "{{ total_apache }}"
+                    - service: "Nginx"
+                      instances: "{{ total_nginx }}"
+                    - service: "Tomcat"
+                      instances: "{{ total_tomcat }}"
+                    - service: "MySQL"
+                      instances: "{{ total_mysql }}"
+                    - service: "PostgreSQL"
+                      instances: "{{ total_postgres }}"
+                    - service: "MongoDB"
+                      instances: "{{ total_mongodb }}"
 
         - name: Display combined payload
           debug:  
