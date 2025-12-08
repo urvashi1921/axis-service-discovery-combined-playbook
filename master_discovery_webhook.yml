@@ -94,7 +94,7 @@
                 job_info:
                   job_id: "{{ tower_job_id | default(ansible_date_time.epoch) }}"
                   job_name: "{{ tower_job_template_name | default(discovery_job_name) }}"
-                  execution_time: "{{ ansible_date_time.iso8601 }}"
+                  execution_time: "{{ '%Y-%m-%dT%H:%M:%S+05:30' | strftime(ansible_date_time.epoch | int + 19800) }}"
                   execution_node: "{{ discovery_execution_node }}"
                   status: "success"
                 discovery_results:
@@ -158,7 +158,7 @@
             headers:
               Content-Type: "application/json"
               X-Job-ID: "{{ tower_job_id | default('manual') }}"
-              X-Timestamp: "{{ ansible_date_time.iso8601 }}"
+              X-Timestamp: "{{ '%Y-%m-%dT%H:%M:%S+05:30' | strftime(ansible_date_time.epoch | int + 19800) }}"
             body: "{{ combined_payload }}"
             status_code: "{{ webhook_expected_status_codes }}"
             timeout: "{{ webhook_timeout }}"
@@ -200,7 +200,7 @@
               job_info:
                 job_id: "{{ tower_job_id | default(ansible_date_time.epoch) }}"
                 job_name: "{{ tower_job_template_name | default(discovery_job_name) }}"
-                execution_time: "{{ ansible_date_time.iso8601 }}"
+                execution_time: "{{ '%Y-%m-%dT%H:%M:%S+05:30' | strftime(ansible_date_time.epoch | int + 19800) }}"
                 status: "failed"
               error:
                 message: "Service discovery failed"
