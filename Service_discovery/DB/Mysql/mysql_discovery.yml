@@ -243,7 +243,7 @@
           hostname: "{{ inventory_hostname }}"
           ip_address: "{{ ansible_default_ipv4.address | default('N/A') }}"
           os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
-          discovery_timestamp: "{{ ansible_date_time.iso8601 }}"
+          discovery_timestamp: "{{ '%Y-%m-%dT%H:%M:%S+05:30' | strftime(ansible_date_time.epoch | int + 19800) }}"
           discovery: "{{ discovery_array | default([]) }}"
 
     - name: Display JSON output
